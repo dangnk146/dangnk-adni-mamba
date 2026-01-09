@@ -29,3 +29,8 @@ pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https
 pip install https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.4/causal_conv1d-1.5.4+cu12torch2.8cxx11abiTRUE-cp310-cp310-linux_x86_64.whl
 pip install https://github.com/state-spaces/mamba/releases/download/v2.2.5/mamba_ssm-2.2.5+cu12torch2.8cxx11abiTRUE-cp310-cp310-linux_x86_64.whl
 ```
+
+
+python UMambaAttention/train_3d.py --model mambavision --train_img_dir "data/train/images" --train_lbl_dir "data/train/labels" --epochs 100 --batch_size 2
+
+torchrun --nproc_per_node=2 UMambaAttention/train_3d.py --model mambavision --train_img_dir "data/train/images" --train_lbl_dir "data/train/labels" --epochs 100 --batch_size 2

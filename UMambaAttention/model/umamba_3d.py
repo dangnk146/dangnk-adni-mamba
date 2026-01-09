@@ -173,7 +173,7 @@ class UNetResEncoder3d(nn.Module):
 class ResidualMambaEncoder3d(nn.Module):
     """3D Encoder with Mamba at every stage (UMambaEnc variant)"""
     def __init__(self, input_size, input_channels, n_stages, features_per_stage, 
-                 strides, n_blocks_per_stage, kernel_sizes=3):
+                 strides, n_blocks_per_stage, kernel_sizes=3, use_hybrid=False):
         super().__init__()
         
         # Same initialization as UNetResEncoder3d
@@ -207,7 +207,9 @@ class ResidualMambaEncoder3d(nn.Module):
                 do_channel_token.append(False)
         
         print(f"[UMambaEnc] Feature map sizes: {feature_map_sizes}")
-        print(f"[UMambaEnc] Channel token: {do_channel_token}")
+        print(f"[UMambaEnc] Channel token: {do_channel_token}") 
+        if use_hybrid:
+            print(f"[UMambaEnc] Using Hybrid Blocks (Attention/Mamba + MLP)")
         
         # Same encoder structure but with Mamba after each stage
         self.conv_pad_sizes = [[k // 2 for k in (ks if isinstance(ks, (list, tuple)) else [ks]*3)] 
@@ -238,11 +240,23 @@ class ResidualMambaEncoder3d(nn.Module):
             
             self.stages.append(nn.Sequential(*stage_blocks))
             
-            # Add Mamba layer
-            mamba_dim = np.prod(feature_map_sizes[s]) if do_channel_token[s] else features_per_stage[s]
-            self.mamba_layers.append(
-                MambaLayer(dim=mamba_dim, channel_token=do_channel_token[s])
-            )
+            # Add Mamba layer or Hybrid Layer
+            if use_hybrid:
+                # Use Attention for later stages (e.g., last 2 stages), Mamba for early
+                if s >= n_stages - 2:
+                    mixer_type = "attention"
+                else:
+                    mixer_type = "mamba"
+                    
+                self.mamba_layers.append(
+                    HybridMambaLayer(dim=features_per_stage[s], mixer_type=mixer_type)
+                )
+            else:
+                # Original MambaLayer
+                mamba_dim = np.prod(feature_map_sizes[s]) if do_channel_token[s] else features_per_stage[s]
+                self.mamba_layers.append(
+                    MambaLayer(dim=mamba_dim, channel_token=do_channel_token[s])
+                )
             
             in_ch = features_per_stage[s]
 
@@ -324,6 +338,273 @@ class UNetResDecoder3d(nn.Module):
         return seg_outputs if self.deep_supervision else seg_outputs[0]
 
 
+# -----------------------------------------------------------------------------------------
+# Hybrid Mamba + Attention Modules (MambaVision Style)
+# -----------------------------------------------------------------------------------------
+
+def window_partition_3d(x, window_size):
+    """
+    Args:
+        x: (B, C, D, H, W)
+        window_size: int
+    Returns:
+        windows: (num_windows*B, window_size^3, C)
+    """
+    B, C, D, H, W = x.shape
+    x = x.view(B, C, D // window_size, window_size, H // window_size, window_size, W // window_size, window_size)
+    windows = x.permute(0, 2, 4, 6, 3, 5, 7, 1).contiguous().view(-1, window_size*window_size*window_size, C)
+    return windows
+
+def window_reverse_3d(windows, window_size, D, H, W):
+    """
+    Args:
+        windows: (num_windows*B, window_size^3, C)
+        window_size: int
+        D, H, W: Original dimensions
+    Returns:
+        x: (B, C, D, H, W)
+    """
+    ws = window_size
+    B = int(windows.shape[0] / (D * H * W / ws / ws / ws))
+    x = windows.view(B, D // ws, H // ws, W // ws, ws, ws, ws, -1)
+    x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous().view(B, -1, D, H, W)
+    return x
+
+class MambaVisionMixer3d(nn.Module):
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, dt_rank="auto", 
+                 dt_min=0.001, dt_max=0.1, dt_init="random", dt_scale=1.0, 
+                 dt_init_floor=1e-4, conv_bias=True, bias=False, device=None, dtype=None):
+        super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(self.expand * self.d_model)
+        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+        
+        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
+        
+        self.conv1d_x = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            bias=conv_bias,
+            kernel_size=d_conv,
+            groups=self.d_inner,
+            padding=d_conv - 1,
+            **factory_kwargs,
+        )
+        self.conv1d_z = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            bias=conv_bias,
+            kernel_size=d_conv,
+            groups=self.d_inner,
+            padding=d_conv - 1,
+            **factory_kwargs,
+        )
+
+        self.x_proj = nn.Linear(
+            self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
+        )
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+        
+        # Init dt_proj
+        dt_init_std = self.dt_rank**-0.5 * dt_scale
+        if dt_init == "constant":
+            nn.init.constant_(self.dt_proj.weight, dt_init_std)
+        elif dt_init == "random":
+            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+        
+        dt = torch.exp(
+            torch.rand(self.d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+        self.dt_proj.bias._no_reinit = True
+        
+        # S4D real initialization
+        A = repeat(
+            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
+            "n -> d n",
+            d=self.d_inner,
+        ).contiguous()
+        A_log = torch.log(A)
+        self.A_log = nn.Parameter(A_log)
+        self.A_log._no_weight_decay = True
+        
+        self.D = nn.Parameter(torch.ones(self.d_inner, device=device))
+        self.D._no_weight_decay = True
+        
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+
+    def forward(self, hidden_states):
+        """
+        hidden_states: (B, L, D)
+        """
+        B, seqlen, _ = hidden_states.shape
+        xz = self.in_proj(hidden_states) # (B, L, 2*d_inner)
+        xz = rearrange(xz, "b l d -> b d l")
+        x, z = xz.chunk(2, dim=1)
+        
+        # Conv1d
+        x = self.conv1d_x(x)[:, :, :seqlen]
+        z = self.conv1d_z(z)[:, :, :seqlen]
+        
+        x = F.silu(x)
+        z = F.silu(z)
+        
+        x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
+        dt, B_ssm, C_ssm = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        
+        dt = rearrange(self.dt_proj(dt), "(b l) d -> b d l", l=seqlen)
+        B_ssm = rearrange(B_ssm, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+        C_ssm = rearrange(C_ssm, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+        
+        A = -torch.exp(self.A_log.float())
+        
+        if selective_scan_fn is not None:
+             y = selective_scan_fn(
+                x, dt, A, B_ssm, C_ssm, self.D.float(), z=None,
+                delta_bias=self.dt_proj.bias.float(),
+                delta_softplus=True,
+                return_last_state=None
+            )
+        else:
+            # Fallback (slow)
+            y = x # Dummy
+            print("Warning: selective_scan_fn not found, skipping SSM core")
+
+        y = y * z # Gated
+        y = rearrange(y, "b d l -> b l d")
+        out = self.out_proj(y)
+        return out
+
+class Attention3d(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., norm_layer=nn.LayerNorm):
+        super().__init__()
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        
+        # Scaled Dot Product Attention
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+class Block3d(nn.Module):
+    def __init__(self, dim, num_heads, mixer_type="mamba", mlp_ratio=4., 
+                 qkv_bias=False, drop=0., attn_drop=0., drop_path=0., 
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        
+        if mixer_type == "attention":
+            self.mixer = Attention3d(dim, num_heads=num_heads, qkv_bias=qkv_bias, 
+                                     attn_drop=attn_drop, proj_drop=drop, norm_layer=norm_layer)
+        else:
+            self.mixer = MambaVisionMixer3d(d_model=dim, d_state=16, d_conv=4, expand=1)
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward(self, x):
+        # x: (B, L, C)
+        x = x + self.drop_path(self.mixer(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+class HybridMambaLayer(nn.Module):
+    """
+    Hybrid Layer that can switch between Mamba and Attention,
+    and includes an MLP.
+    Drop-in replacement for MambaLayer in ResidualMambaEncoder3d.
+    """
+    def __init__(self, dim, mixer_type="mamba", num_heads=8, window_size=8, 
+                 mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0., drop_path=0.):
+        super().__init__()
+        self.dim = dim
+        self.mixer_type = mixer_type
+        self.window_size = window_size
+        
+        # We reuse the Block3d defined above
+        self.block = Block3d(
+            dim=dim, 
+            num_heads=num_heads, 
+            mixer_type=mixer_type, 
+            mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias, 
+            drop=drop, 
+            attn_drop=attn_drop, 
+            drop_path=drop_path
+        )
+
+    def forward(self, x):
+        # Input x: (B, C, D, H, W)
+        B, C, D, H, W = x.shape
+        
+        # Flatten to (B, L, C) for the block
+        x_flat = x.flatten(2).transpose(1, 2) # (B, D*H*W, C)
+        
+        if self.mixer_type == "attention":
+            # Handle Window Attention if needed
+            # Reshape back to image for windowing
+            x_Reshaped = x # (B, C, D, H, W)
+            
+            # Pad
+            pad_d = (self.window_size - D % self.window_size) % self.window_size
+            pad_h = (self.window_size - H % self.window_size) % self.window_size
+            pad_w = (self.window_size - W % self.window_size) % self.window_size
+            
+            if pad_d > 0 or pad_h > 0 or pad_w > 0:
+                x_Reshaped = F.pad(x_Reshaped, (0, pad_w, 0, pad_h, 0, pad_d))
+            
+            Dp, Hp, Wp = x_Reshaped.shape[2:]
+            
+            # Partition
+            windows = window_partition_3d(x_Reshaped, self.window_size) # (N_win*B, ws^3, C)
+            
+            # Apply Block
+            windows = self.block(windows)
+            
+            # Reverse
+            x_Reshaped = window_reverse_3d(windows, self.window_size, Dp, Hp, Wp)
+            
+            # Crop padding
+            if pad_d > 0 or pad_h > 0 or pad_w > 0:
+                x_Reshaped = x_Reshaped[:, :, :D, :H, :W]
+            
+            out = x_Reshaped
+            
+        else:
+            # Mamba is global
+            x_out_flat = self.block(x_flat)
+            out = x_out_flat.transpose(1, 2).view(B, C, D, H, W)
+            
+        return out
+
+
 class UMambaBot3d(nn.Module):
     """
     U-Mamba Bottleneck 3D: Mamba only at the bottleneck
@@ -373,7 +654,7 @@ class UMambaEnc3d(nn.Module):
     """
     def __init__(self, input_size, input_channels, num_classes, n_stages=6,
                  features_per_stage=None, strides=None,
-                 n_blocks_per_stage=None, deep_supervision=True):
+                 n_blocks_per_stage=None, deep_supervision=True, use_hybrid=False):
         super().__init__()
         
         if features_per_stage is None:
@@ -387,7 +668,7 @@ class UMambaEnc3d(nn.Module):
         
         self.encoder = ResidualMambaEncoder3d(
             input_size, input_channels, n_stages, features_per_stage, 
-            strides, n_blocks_per_stage
+            strides, n_blocks_per_stage, use_hybrid=use_hybrid
         )
         
         # Decoder
