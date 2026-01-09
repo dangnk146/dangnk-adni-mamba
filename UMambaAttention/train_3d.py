@@ -19,7 +19,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-from model.umamba_3d import create_umamba_bot_3d, create_umamba_enc_3d, create_mambavision_3d
+from model.umamba_3d import create_umamba_bot_3d, create_umamba_enc_3d
 from utils.dataset_3d import get_dataloaders_3d
 
 
@@ -292,11 +292,14 @@ def train(args):
             deep_supervision=args.deep_supervision
         )
     elif args.model == "mambavision":
-        model = create_mambavision_3d(
+        # MambaVision is now implemented as a configuration of UMambaEnc
+        model = create_umamba_enc_3d(
             input_size=tuple(args.patch_size),
             input_channels=args.input_channels,
             num_classes=args.num_classes,
-            deep_supervision=args.deep_supervision
+            n_stages=args.n_stages,
+            deep_supervision=args.deep_supervision,
+            use_hybrid=True
         )
     else:
         raise ValueError(f"Unknown model: {args.model}")
